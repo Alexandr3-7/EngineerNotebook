@@ -554,66 +554,69 @@ namespace EngineerNotebook.Data
         {
             using var con = OpenConnection();
 
-            // берём версию
-            NoteVersion? v;
+            // 1) берём выбранную версию (включая SavedAt!)
+            long noteId;
+            string title, content, category, tags, savedAt;
+
             using (var cmd = con.CreateCommand())
             {
                 cmd.CommandText =
                 """
-                SELECT VersionId, NoteId, Title, Content,
-                       IFNULL(Category,'Без категории') as Category,
-                       IFNULL(Tags,'') as Tags
-                FROM NoteVersions
-                WHERE VersionId = $vid
-                LIMIT 1;
-                """;
+        SELECT NoteId,
+               Title,
+               Content,
+               IFNULL(Category,'Без категории') as Category,
+               IFNULL(Tags,'') as Tags,
+               SavedAt
+        FROM NoteVersions
+        WHERE VersionId = $vid
+        LIMIT 1;
+        """;
                 cmd.Parameters.AddWithValue("$vid", versionId);
 
                 using var r = cmd.ExecuteReader();
                 if (!r.Read()) return;
 
-                v = new NoteVersion
-                {
-                    VersionId = r.GetInt64(0),
-                    NoteId = r.GetInt64(1),
-                    Title = r.GetString(2),
-                    Content = r.GetString(3),
-                    Category = r.GetString(4),
-                    Tags = r.GetString(5),
-                    SavedAt = DateTime.Now
-                };
+                noteId = r.GetInt64(0);
+                title = r.GetString(1);
+                content = r.GetString(2);
+                category = r.GetString(3);
+                tags = r.GetString(4);
+                savedAt = r.GetString(5); // ← время ТОЙ версии
             }
 
             using var tx = con.BeginTransaction();
 
+            // 2) делаем выбранную версию текущей + переносим данные в Notes
+            //    UpdatedAt ставим НЕ DateTime.Now, а savedAt
             using (var cmd = con.CreateCommand())
             {
                 cmd.Transaction = tx;
                 cmd.CommandText =
                 """
-                UPDATE Notes
-                SET Title = $t,
-                    Content = $c,
-                    Category = $cat,
-                    Tags = $tags,
-                    UpdatedAt = $u,
-                    CurrentVersionId = $vid
-                WHERE Id = $nid;
-                """;
-                cmd.Parameters.AddWithValue("$nid", v!.NoteId);
-                cmd.Parameters.AddWithValue("$vid", v.VersionId);
-                cmd.Parameters.AddWithValue("$t", v.Title);
-                cmd.Parameters.AddWithValue("$c", v.Content);
-                cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(v.Category) ? "Без категории" : v.Category.Trim());
-                cmd.Parameters.AddWithValue("$tags", v.Tags?.Trim() ?? "");
-                cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+        UPDATE Notes
+        SET Title = $t,
+            Content = $c,
+            Category = $cat,
+            Tags = $tags,
+            UpdatedAt = $updated,
+            CurrentVersionId = $vid
+        WHERE Id = $nid;
+        """;
+                cmd.Parameters.AddWithValue("$nid", noteId);
+                cmd.Parameters.AddWithValue("$vid", versionId);
+                cmd.Parameters.AddWithValue("$t", title);
+                cmd.Parameters.AddWithValue("$c", content);
+                cmd.Parameters.AddWithValue("$cat", category);
+                cmd.Parameters.AddWithValue("$tags", tags);
+                cmd.Parameters.AddWithValue("$updated", savedAt); // ✅ ключевой момент
                 cmd.ExecuteNonQuery();
             }
 
             tx.Commit();
 
-            // после восстановления тоже можно подчистить, но текущую не трогаем
-            TrimVersions(v!.NoteId, 50);
+            // 3) ограничиваем число версий
+            TrimVersions(noteId, 50);
         }
 
         /// <summary>
