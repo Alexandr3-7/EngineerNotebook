@@ -14,7 +14,7 @@ namespace EngineerNotebook.Services
             _repo = repo;
         }
 
-        // ---- Categories ----
+        // Categories
         public List<string> GetCategories() => _repo.GetCategories();
 
         public void AddCategory(string name)
@@ -31,7 +31,7 @@ namespace EngineerNotebook.Services
             _repo.DeleteCategory(name);
         }
 
-        // ---- Notes ----
+        // Notes
         public Note? GetNote(long id) => _repo.GetById(id);
 
         public List<Note> Search(string query, string categoryFilter)
@@ -68,9 +68,7 @@ namespace EngineerNotebook.Services
             category = NormalizeCategory(category);
             tags = NormalizeTags(tags);
 
-            // ✅ перед обновлением фиксируем текущую версию в истории
-            _repo.SaveCurrentVersion(id);
-
+            // ✅ Update теперь создаёт НОВУЮ версию (а не “сохраняет старую”)
             _repo.Update(new Note
             {
                 Id = id,
@@ -88,7 +86,7 @@ namespace EngineerNotebook.Services
             _repo.Delete(id);
         }
 
-        // ---- Versions ----
+        // Versions
         public List<NoteVersion> GetVersions(long noteId)
         {
             if (noteId <= 0) return new List<NoteVersion>();

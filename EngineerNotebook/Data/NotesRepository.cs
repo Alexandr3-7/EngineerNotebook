@@ -44,7 +44,8 @@ namespace EngineerNotebook.Data
                     Category TEXT,
                     Tags TEXT,
                     CreatedAt TEXT NOT NULL,
-                    UpdatedAt TEXT NOT NULL
+                    UpdatedAt TEXT NOT NULL,
+                    CurrentVersionId INTEGER
                 );
 
                 CREATE INDEX IF NOT EXISTS IX_Notes_Title ON Notes(Title);
@@ -52,34 +53,23 @@ namespace EngineerNotebook.Data
                 cmd.ExecuteNonQuery();
             }
 
-            // Миграции колонок
+            // миграции колонок (на всякий)
             if (!ColumnExists(con, "Notes", "Category"))
             {
                 using var cmd = con.CreateCommand();
                 cmd.CommandText = "ALTER TABLE Notes ADD COLUMN Category TEXT;";
                 cmd.ExecuteNonQuery();
             }
-
             if (!ColumnExists(con, "Notes", "Tags"))
             {
                 using var cmd = con.CreateCommand();
                 cmd.CommandText = "ALTER TABLE Notes ADD COLUMN Tags TEXT;";
                 cmd.ExecuteNonQuery();
             }
-
-            // Нормализация
-            using (var cmd = con.CreateCommand())
+            if (!ColumnExists(con, "Notes", "CurrentVersionId"))
             {
-                cmd.CommandText =
-                """
-                UPDATE Notes
-                SET Category='Без категории'
-                WHERE Category IS NULL OR TRIM(Category)='';
-
-                UPDATE Notes
-                SET Tags=''
-                WHERE Tags IS NULL;
-                """;
+                using var cmd = con.CreateCommand();
+                cmd.CommandText = "ALTER TABLE Notes ADD COLUMN CurrentVersionId INTEGER;";
                 cmd.ExecuteNonQuery();
             }
 
@@ -95,14 +85,14 @@ namespace EngineerNotebook.Data
                 INSERT OR IGNORE INTO Categories(Name) VALUES('Без категории');
 
                 INSERT OR IGNORE INTO Categories(Name)
-                SELECT DISTINCT Category
+                SELECT DISTINCT IFNULL(Category,'Без категории')
                 FROM Notes
-                WHERE Category IS NOT NULL AND TRIM(Category) <> '';
+                WHERE IFNULL(TRIM(Category),'') <> '';
                 """;
                 cmd.ExecuteNonQuery();
             }
 
-            // NoteVersions (история изменений)
+            // NoteVersions
             using (var cmd = con.CreateCommand())
             {
                 cmd.CommandText =
@@ -122,6 +112,110 @@ namespace EngineerNotebook.Data
                 ON NoteVersions(NoteId, SavedAt DESC);
                 """;
                 cmd.ExecuteNonQuery();
+            }
+
+            // ✅ миграция существующих данных:
+            // 1) нормализуем Notes
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.CommandText =
+                """
+                UPDATE Notes
+                SET Category='Без категории'
+                WHERE Category IS NULL OR TRIM(Category)='';
+
+                UPDATE Notes
+                SET Tags=''
+                WHERE Tags IS NULL;
+                """;
+                cmd.ExecuteNonQuery();
+            }
+
+            // 2) для каждой заметки гарантируем CurrentVersionId:
+            //    - если есть версии → ставим последнюю
+            //    - если нет версий → создаём версию из Notes и ставим её
+            var noteIds = new List<long>();
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.CommandText = "SELECT Id FROM Notes;";
+                using var r = cmd.ExecuteReader();
+                while (r.Read()) noteIds.Add(r.GetInt64(0));
+            }
+
+            foreach (var nid in noteIds)
+            {
+                long? lastVid = null;
+
+                using (var cmd = con.CreateCommand())
+                {
+                    cmd.CommandText =
+                    """
+                    SELECT VersionId
+                    FROM NoteVersions
+                    WHERE NoteId = $nid
+                    ORDER BY datetime(SavedAt) DESC, VersionId DESC
+                    LIMIT 1;
+                    """;
+                    cmd.Parameters.AddWithValue("$nid", nid);
+                    var obj = cmd.ExecuteScalar();
+                    if (obj != null && obj != DBNull.Value)
+                        lastVid = Convert.ToInt64(obj);
+                }
+
+                if (lastVid == null)
+                {
+                    // создаём initial-версию из Notes
+                    using var tx = con.BeginTransaction();
+
+                    long newVid;
+                    using (var cmd = con.CreateCommand())
+                    {
+                        cmd.Transaction = tx;
+                        cmd.CommandText =
+                        """
+                        INSERT INTO NoteVersions(NoteId, Title, Content, Category, Tags, SavedAt)
+                        SELECT Id,
+                               Title,
+                               Content,
+                               IFNULL(Category,'Без категории'),
+                               IFNULL(Tags,''),
+                               $saved
+                        FROM Notes
+                        WHERE Id = $nid
+                        LIMIT 1;
+
+                        SELECT last_insert_rowid();
+                        """;
+                        cmd.Parameters.AddWithValue("$nid", nid);
+                        cmd.Parameters.AddWithValue("$saved", DateTime.Now.ToString("O"));
+                        newVid = Convert.ToInt64(cmd.ExecuteScalar());
+                    }
+
+                    using (var cmd = con.CreateCommand())
+                    {
+                        cmd.Transaction = tx;
+                        cmd.CommandText = "UPDATE Notes SET CurrentVersionId=$vid WHERE Id=$nid;";
+                        cmd.Parameters.AddWithValue("$vid", newVid);
+                        cmd.Parameters.AddWithValue("$nid", nid);
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    tx.Commit();
+                }
+                else
+                {
+                    // если CurrentVersionId пустой — проставим
+                    using var cmd = con.CreateCommand();
+                    cmd.CommandText =
+                    """
+                    UPDATE Notes
+                    SET CurrentVersionId = COALESCE(CurrentVersionId, $vid)
+                    WHERE Id = $nid;
+                    """;
+                    cmd.Parameters.AddWithValue("$vid", lastVid.Value);
+                    cmd.Parameters.AddWithValue("$nid", nid);
+                    cmd.ExecuteNonQuery();
+                }
             }
         }
 
@@ -207,7 +301,8 @@ namespace EngineerNotebook.Data
             SELECT Id, Title, Content,
                    IFNULL(Category,'Без категории') as Category,
                    IFNULL(Tags,'') as Tags,
-                   CreatedAt, UpdatedAt
+                   CreatedAt, UpdatedAt,
+                   IFNULL(CurrentVersionId,0) as CurrentVersionId
             FROM Notes
             WHERE Id = $id
             LIMIT 1;
@@ -225,7 +320,8 @@ namespace EngineerNotebook.Data
                 Category = r.GetString(3),
                 Tags = r.GetString(4),
                 CreatedAt = DateTime.Parse(r.GetString(5)),
-                UpdatedAt = DateTime.Parse(r.GetString(6))
+                UpdatedAt = DateTime.Parse(r.GetString(6)),
+                CurrentVersionId = r.GetInt64(7)
             };
         }
 
@@ -255,7 +351,8 @@ namespace EngineerNotebook.Data
             SELECT Id, Title, Content,
                    IFNULL(Category, 'Без категории') as Category,
                    IFNULL(Tags, '') as Tags,
-                   CreatedAt, UpdatedAt
+                   CreatedAt, UpdatedAt,
+                   IFNULL(CurrentVersionId,0) as CurrentVersionId
             FROM Notes
             {where}
             ORDER BY datetime(UpdatedAt) DESC;
@@ -273,107 +370,134 @@ namespace EngineerNotebook.Data
                     Category = r.GetString(3),
                     Tags = r.GetString(4),
                     CreatedAt = DateTime.Parse(r.GetString(5)),
-                    UpdatedAt = DateTime.Parse(r.GetString(6))
+                    UpdatedAt = DateTime.Parse(r.GetString(6)),
+                    CurrentVersionId = r.GetInt64(7)
                 });
             }
             return list;
         }
 
+        /// <summary>
+        /// ✅ Добавление: создаём заметку + сразу создаём initial-версию и делаем её текущей.
+        /// </summary>
         public long Insert(Note note)
         {
             using var con = OpenConnection();
+            using var tx = con.BeginTransaction();
 
-            using var cmd = con.CreateCommand();
-            cmd.CommandText =
-            """
-            INSERT INTO Notes(Title, Content, Category, Tags, CreatedAt, UpdatedAt)
-            VALUES($title, $content, $cat, $tags, $created, $updated);
-            SELECT last_insert_rowid();
-            """;
-            cmd.Parameters.AddWithValue("$title", note.Title);
-            cmd.Parameters.AddWithValue("$content", note.Content);
-            cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(note.Category) ? "Без категории" : note.Category.Trim());
-            cmd.Parameters.AddWithValue("$tags", note.Tags?.Trim() ?? "");
-            cmd.Parameters.AddWithValue("$created", note.CreatedAt.ToString("O"));
-            cmd.Parameters.AddWithValue("$updated", note.UpdatedAt.ToString("O"));
-
-            return (long)(cmd.ExecuteScalar() ?? 0L);
-        }
-
-        /// <summary>Сохраняет текущую версию заметки в NoteVersions.</summary>
-        public void SaveCurrentVersion(long noteId)
-        {
-            using var con = OpenConnection();
-
-            // читаем текущую заметку
-            Note? cur;
+            long noteId;
             using (var cmd = con.CreateCommand())
             {
+                cmd.Transaction = tx;
                 cmd.CommandText =
                 """
-                SELECT Id, Title, Content,
-                       IFNULL(Category,'Без категории') as Category,
-                       IFNULL(Tags,'') as Tags
-                FROM Notes
-                WHERE Id = $id
-                LIMIT 1;
+                INSERT INTO Notes(Title, Content, Category, Tags, CreatedAt, UpdatedAt, CurrentVersionId)
+                VALUES($title, $content, $cat, $tags, $created, $updated, 0);
+                SELECT last_insert_rowid();
                 """;
-                cmd.Parameters.AddWithValue("$id", noteId);
+                cmd.Parameters.AddWithValue("$title", note.Title);
+                cmd.Parameters.AddWithValue("$content", note.Content);
+                cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(note.Category) ? "Без категории" : note.Category.Trim());
+                cmd.Parameters.AddWithValue("$tags", note.Tags?.Trim() ?? "");
+                cmd.Parameters.AddWithValue("$created", note.CreatedAt.ToString("O"));
+                cmd.Parameters.AddWithValue("$updated", note.UpdatedAt.ToString("O"));
 
-                using var r = cmd.ExecuteReader();
-                if (!r.Read()) return;
-
-                cur = new Note
-                {
-                    Id = r.GetInt64(0),
-                    Title = r.GetString(1),
-                    Content = r.GetString(2),
-                    Category = r.GetString(3),
-                    Tags = r.GetString(4)
-                };
+                noteId = Convert.ToInt64(cmd.ExecuteScalar());
             }
 
-            // записываем версию
+            long versionId;
             using (var cmd = con.CreateCommand())
             {
+                cmd.Transaction = tx;
                 cmd.CommandText =
                 """
                 INSERT INTO NoteVersions(NoteId, Title, Content, Category, Tags, SavedAt)
                 VALUES($nid, $t, $c, $cat, $tags, $saved);
+                SELECT last_insert_rowid();
                 """;
-                cmd.Parameters.AddWithValue("$nid", cur!.Id);
-                cmd.Parameters.AddWithValue("$t", cur.Title);
-                cmd.Parameters.AddWithValue("$c", cur.Content);
-                cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(cur.Category) ? "Без категории" : cur.Category.Trim());
-                cmd.Parameters.AddWithValue("$tags", cur.Tags?.Trim() ?? "");
+                cmd.Parameters.AddWithValue("$nid", noteId);
+                cmd.Parameters.AddWithValue("$t", note.Title);
+                cmd.Parameters.AddWithValue("$c", note.Content);
+                cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(note.Category) ? "Без категории" : note.Category.Trim());
+                cmd.Parameters.AddWithValue("$tags", note.Tags?.Trim() ?? "");
                 cmd.Parameters.AddWithValue("$saved", DateTime.Now.ToString("O"));
+
+                versionId = Convert.ToInt64(cmd.ExecuteScalar());
+            }
+
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = "UPDATE Notes SET CurrentVersionId=$vid WHERE Id=$nid;";
+                cmd.Parameters.AddWithValue("$vid", versionId);
+                cmd.Parameters.AddWithValue("$nid", noteId);
                 cmd.ExecuteNonQuery();
             }
+
+            tx.Commit();
+
+            // чистим до 50 (на всякий)
+            TrimVersions(noteId, 50);
+
+            return noteId;
         }
 
+        /// <summary>
+        /// ✅ Update = создаём новую версию (новые данные) -> делаем её текущей.
+        /// </summary>
         public void Update(Note note)
         {
             using var con = OpenConnection();
+            using var tx = con.BeginTransaction();
 
-            using var cmd = con.CreateCommand();
-            cmd.CommandText =
-            """
-            UPDATE Notes
-            SET Title = $title,
-                Content = $content,
-                Category = $cat,
-                Tags = $tags,
-                UpdatedAt = $updated
-            WHERE Id = $id;
-            """;
-            cmd.Parameters.AddWithValue("$title", note.Title);
-            cmd.Parameters.AddWithValue("$content", note.Content);
-            cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(note.Category) ? "Без категории" : note.Category.Trim());
-            cmd.Parameters.AddWithValue("$tags", note.Tags?.Trim() ?? "");
-            cmd.Parameters.AddWithValue("$updated", note.UpdatedAt.ToString("O"));
-            cmd.Parameters.AddWithValue("$id", note.Id);
+            long versionId;
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText =
+                """
+                INSERT INTO NoteVersions(NoteId, Title, Content, Category, Tags, SavedAt)
+                VALUES($nid, $t, $c, $cat, $tags, $saved);
+                SELECT last_insert_rowid();
+                """;
+                cmd.Parameters.AddWithValue("$nid", note.Id);
+                cmd.Parameters.AddWithValue("$t", note.Title);
+                cmd.Parameters.AddWithValue("$c", note.Content);
+                cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(note.Category) ? "Без категории" : note.Category.Trim());
+                cmd.Parameters.AddWithValue("$tags", note.Tags?.Trim() ?? "");
+                cmd.Parameters.AddWithValue("$saved", DateTime.Now.ToString("O"));
 
-            cmd.ExecuteNonQuery();
+                versionId = Convert.ToInt64(cmd.ExecuteScalar());
+            }
+
+            using (var cmd = con.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText =
+                """
+                UPDATE Notes
+                SET Title = $title,
+                    Content = $content,
+                    Category = $cat,
+                    Tags = $tags,
+                    UpdatedAt = $updated,
+                    CurrentVersionId = $vid
+                WHERE Id = $id;
+                """;
+                cmd.Parameters.AddWithValue("$title", note.Title);
+                cmd.Parameters.AddWithValue("$content", note.Content);
+                cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(note.Category) ? "Без категории" : note.Category.Trim());
+                cmd.Parameters.AddWithValue("$tags", note.Tags?.Trim() ?? "");
+                cmd.Parameters.AddWithValue("$updated", note.UpdatedAt.ToString("O"));
+                cmd.Parameters.AddWithValue("$vid", versionId);
+                cmd.Parameters.AddWithValue("$id", note.Id);
+                cmd.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+
+            // ✅ лимит 50 версий
+            TrimVersions(note.Id, 50);
         }
 
         public void Delete(long id)
@@ -401,7 +525,7 @@ namespace EngineerNotebook.Data
                    SavedAt
             FROM NoteVersions
             WHERE NoteId = $nid
-            ORDER BY datetime(SavedAt) DESC;
+            ORDER BY datetime(SavedAt) DESC, VersionId DESC;
             """;
             cmd.Parameters.AddWithValue("$nid", noteId);
 
@@ -423,44 +547,14 @@ namespace EngineerNotebook.Data
             return list;
         }
 
-        public NoteVersion? GetVersion(long versionId)
-        {
-            using var con = OpenConnection();
-
-            using var cmd = con.CreateCommand();
-            cmd.CommandText =
-            """
-            SELECT VersionId, NoteId, Title, Content,
-                   IFNULL(Category,'Без категории') as Category,
-                   IFNULL(Tags,'') as Tags,
-                   SavedAt
-            FROM NoteVersions
-            WHERE VersionId = $vid
-            LIMIT 1;
-            """;
-            cmd.Parameters.AddWithValue("$vid", versionId);
-
-            using var r = cmd.ExecuteReader();
-            if (!r.Read()) return null;
-
-            return new NoteVersion
-            {
-                VersionId = r.GetInt64(0),
-                NoteId = r.GetInt64(1),
-                Title = r.GetString(2),
-                Content = r.GetString(3),
-                Category = r.GetString(4),
-                Tags = r.GetString(5),
-                SavedAt = DateTime.Parse(r.GetString(6))
-            };
-        }
-
-        /// <summary>Восстановить заметку из версии. Перед восстановлением сохраняем текущую версию (чтобы можно было откатить назад).</summary>
+        /// <summary>
+        /// ✅ Восстановление = просто делаем выбранную версию текущей (без создания новой версии).
+        /// </summary>
         public void RestoreFromVersion(long versionId)
         {
             using var con = OpenConnection();
 
-            // берем версию
+            // берём версию
             NoteVersion? v;
             using (var cmd = con.CreateCommand())
             {
@@ -492,27 +586,6 @@ namespace EngineerNotebook.Data
 
             using var tx = con.BeginTransaction();
 
-            // сохраняем текущую версию заметки (перед откатом)
-            using (var cmd = con.CreateCommand())
-            {
-                cmd.Transaction = tx;
-                cmd.CommandText =
-                """
-                INSERT INTO NoteVersions(NoteId, Title, Content, Category, Tags, SavedAt)
-                SELECT Id, Title, Content,
-                       IFNULL(Category,'Без категории'),
-                       IFNULL(Tags,''),
-                       $saved
-                FROM Notes
-                WHERE Id = $nid
-                LIMIT 1;
-                """;
-                cmd.Parameters.AddWithValue("$nid", v!.NoteId);
-                cmd.Parameters.AddWithValue("$saved", DateTime.Now.ToString("O"));
-                cmd.ExecuteNonQuery();
-            }
-
-            // обновляем Notes из версии
             using (var cmd = con.CreateCommand())
             {
                 cmd.Transaction = tx;
@@ -523,10 +596,12 @@ namespace EngineerNotebook.Data
                     Content = $c,
                     Category = $cat,
                     Tags = $tags,
-                    UpdatedAt = $u
+                    UpdatedAt = $u,
+                    CurrentVersionId = $vid
                 WHERE Id = $nid;
                 """;
                 cmd.Parameters.AddWithValue("$nid", v!.NoteId);
+                cmd.Parameters.AddWithValue("$vid", v.VersionId);
                 cmd.Parameters.AddWithValue("$t", v.Title);
                 cmd.Parameters.AddWithValue("$c", v.Content);
                 cmd.Parameters.AddWithValue("$cat", string.IsNullOrWhiteSpace(v.Category) ? "Без категории" : v.Category.Trim());
@@ -536,6 +611,39 @@ namespace EngineerNotebook.Data
             }
 
             tx.Commit();
+
+            // после восстановления тоже можно подчистить, но текущую не трогаем
+            TrimVersions(v!.NoteId, 50);
+        }
+
+        /// <summary>
+        /// ✅ Оставляем последние N версий + всегда сохраняем текущую, даже если она старая.
+        /// </summary>
+        private void TrimVersions(long noteId, int keep)
+        {
+            using var con = OpenConnection();
+
+            using var cmd = con.CreateCommand();
+            cmd.CommandText =
+            $"""
+            DELETE FROM NoteVersions
+            WHERE NoteId = $nid
+              AND VersionId NOT IN (
+                    SELECT VersionId FROM (
+                        SELECT VersionId
+                        FROM NoteVersions
+                        WHERE NoteId = $nid
+                        ORDER BY datetime(SavedAt) DESC, VersionId DESC
+                        LIMIT {keep}
+                    )
+                    UNION
+                    SELECT IFNULL(CurrentVersionId, 0)
+                    FROM Notes
+                    WHERE Id = $nid
+              );
+            """;
+            cmd.Parameters.AddWithValue("$nid", noteId);
+            cmd.ExecuteNonQuery();
         }
     }
 }

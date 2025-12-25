@@ -20,10 +20,9 @@ namespace EngineerNotebook.UI
         private Button _btnRestore = null!;
         private Button _btnClose = null!;
 
-        private Note? _currentNote;
+        private Note? _note;
         private NoteVersion[] _versions = Array.Empty<NoteVersion>();
 
-        private bool _selectedIsCurrent = true;
         private long _selectedVersionId = 0;
 
         public VersionsForm(NotesService service, long noteId, string noteTitle)
@@ -65,51 +64,12 @@ namespace EngineerNotebook.UI
                 RowHeadersVisible = false
             };
 
-            // Видимые
-            _grid.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "Type",
-                HeaderText = "Тип",
-                DataPropertyName = "Type",
-                Width = 90
-            });
-            _grid.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "SavedAt",
-                HeaderText = "Дата",
-                DataPropertyName = "SavedAt",
-                Width = 170
-            });
-            _grid.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "Category",
-                HeaderText = "Категория",
-                DataPropertyName = "Category",
-                Width = 170
-            });
-            _grid.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "Tags",
-                HeaderText = "Теги",
-                DataPropertyName = "Tags",
-                Width = 300
-            });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "State", HeaderText = "Состояние", DataPropertyName = "State", Width = 110 });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "SavedAt", HeaderText = "Дата", DataPropertyName = "SavedAt", Width = 170 });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Category", HeaderText = "Категория", DataPropertyName = "Category", Width = 170 });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Tags", HeaderText = "Теги", DataPropertyName = "Tags", Width = 320 });
 
-            // Служебные (скрытые)
-            _grid.Columns.Add(new DataGridViewTextBoxColumn
-            {
-                Name = "VersionId",
-                HeaderText = "VersionId",
-                DataPropertyName = "VersionId",
-                Visible = false
-            });
-            _grid.Columns.Add(new DataGridViewCheckBoxColumn
-            {
-                Name = "IsCurrent",
-                HeaderText = "IsCurrent",
-                DataPropertyName = "IsCurrent",
-                Visible = false
-            });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "VersionId", HeaderText = "VersionId", DataPropertyName = "VersionId", Visible = false });
 
             _grid.CellClick += (_, __) => OnSelectRow();
 
@@ -165,49 +125,38 @@ namespace EngineerNotebook.UI
 
         private void LoadVersions()
         {
-            _currentNote = _service.GetNote(_noteId);
-            _versions = _service.GetVersions(_noteId).ToArray();
-
-            if (_currentNote == null)
+            _note = _service.GetNote(_noteId);
+            if (_note == null)
             {
                 MessageBox.Show("Заметка не найдена (возможно, удалена).", "История", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 Close();
                 return;
             }
 
-            // ✅ первая строка — текущая версия
-            var rows = new[] {
-                new
-                {
-                    Type = "Текущая",
-                    SavedAt = _currentNote.UpdatedAt.ToString("dd.MM.yyyy HH:mm:ss"),
-                    Category = _currentNote.Category ?? "Без категории",
-                    Tags = _currentNote.Tags ?? "",
-                    VersionId = 0L,
-                    IsCurrent = true
-                }
-            }
-            .Concat(_versions.Select(v => new
+            _versions = _service.GetVersions(_noteId).ToArray();
+
+            var rows = _versions.Select(v => new
             {
-                Type = "Версия",
+                v.VersionId,
+                State = (v.VersionId == _note.CurrentVersionId) ? "Текущая" : "",
                 SavedAt = v.SavedAt.ToString("dd.MM.yyyy HH:mm:ss"),
                 Category = v.Category ?? "Без категории",
-                Tags = v.Tags ?? "",
-                VersionId = v.VersionId,
-                IsCurrent = false
-            }))
-            .ToList();
+                Tags = v.Tags ?? ""
+            }).ToList();
 
             _grid.DataSource = null;
             _grid.DataSource = rows;
 
-            // по умолчанию выбираем "текущую"
-            if (_grid.Rows.Count > 0)
+            // выберем текущую (если есть), иначе первую
+            var idx = rows.FindIndex(x => x.VersionId == _note.CurrentVersionId);
+            if (idx < 0) idx = rows.Count > 0 ? 0 : -1;
+
+            if (idx >= 0)
             {
                 _grid.ClearSelection();
-                _grid.Rows[0].Selected = true;
-                _grid.CurrentCell = _grid.Rows[0].Cells["Type"];
-                ShowCurrentPreview();
+                _grid.Rows[idx].Selected = true;
+                _grid.CurrentCell = _grid.Rows[idx].Cells["State"];
+                ShowVersion(_versions.First(v => v.VersionId == rows[idx].VersionId));
             }
         }
 
@@ -215,56 +164,38 @@ namespace EngineerNotebook.UI
         {
             if (_grid.CurrentRow == null) return;
 
-            var isCurrentObj = _grid.CurrentRow.Cells["IsCurrent"].Value;
-            var versionObj = _grid.CurrentRow.Cells["VersionId"].Value;
+            var idObj = _grid.CurrentRow.Cells["VersionId"].Value;
+            if (idObj == null) return;
 
-            var isCurrent = isCurrentObj is bool b && b;
-
-            _selectedIsCurrent = isCurrent;
-            _selectedVersionId = 0;
-
-            if (isCurrent)
-            {
-                ShowCurrentPreview();
-                return;
-            }
-
-            if (versionObj == null) return;
-            if (!long.TryParse(versionObj.ToString(), out var vid)) return;
+            if (!long.TryParse(idObj.ToString(), out var vid)) return;
 
             var v = _versions.FirstOrDefault(x => x.VersionId == vid);
             if (v == null) return;
 
+            ShowVersion(v);
+
             _selectedVersionId = v.VersionId;
 
-            _tbTitle.Text = v.Title;
-            _tbCategory.Text = v.Category;
-            _tbTags.Text = v.Tags;
-            _tbContent.Text = v.Content;
-
-            _btnRestore.Enabled = true;
+            // ✅ если выбрана текущая — восстанавливать нельзя
+            _btnRestore.Enabled = (_note != null && v.VersionId != _note.CurrentVersionId);
         }
 
-        private void ShowCurrentPreview()
+        private void ShowVersion(NoteVersion v)
         {
-            if (_currentNote == null) return;
-
-            _tbTitle.Text = _currentNote.Title;
-            _tbCategory.Text = _currentNote.Category ?? "Без категории";
-            _tbTags.Text = _currentNote.Tags ?? "";
-            _tbContent.Text = _currentNote.Content;
-
-            // на текущую восстанавливать не надо
-            _btnRestore.Enabled = false;
+            _tbTitle.Text = v.Title;
+            _tbCategory.Text = v.Category ?? "Без категории";
+            _tbTags.Text = v.Tags ?? "";
+            _tbContent.Text = v.Content;
         }
 
         private void RestoreSelected()
         {
-            if (_selectedIsCurrent) return;
+            if (_note == null) return;
             if (_selectedVersionId <= 0) return;
+            if (_selectedVersionId == _note.CurrentVersionId) return;
 
             var res = MessageBox.Show(
-                "Восстановить выбранную версию? Текущая версия тоже сохранится в истории.",
+                "Сделать выбранную версию текущей? Новая версия при этом НЕ создаётся.",
                 "Подтверждение",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question);
